@@ -5,7 +5,7 @@ import struct
 # ==========================================
 # การตั้งค่า (Configuration)
 # ==========================================
-ESP32_IP = "YOUR_ESP32_IP"  # <--- เอารหัส IP ที่ได้จาก ESP32 มาใส่ตรงนี้
+ESP32_IP = "192.168.137.66"  # <--- เอารหัส IP ที่ได้จาก ESP32 มาใส่ตรงนี้
 ESP32_PORT = 12345
 
 class UDPSender:
@@ -29,6 +29,9 @@ class UDPSender:
         """
         data = struct.pack('<Ifff', self.packet_seq, float(x), float(y), float(z))
         self.sock.sendto(data, (self.ip, self.port))
+        
+        # แสดง log บนหน้าจอ Terminal/Command Prompt
+        print(f"[UDP_SENDER] ส่งไป ESP32 -> ลำดับ: {self.packet_seq} | X: {x:.2f}, Y: {y:.2f}, Z: {z:.2f}")
         
         self.packet_seq += 1 # เพิ่มลำดับทุกครั้งที่ส่ง
 

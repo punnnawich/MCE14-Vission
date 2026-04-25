@@ -46,8 +46,10 @@ class BallTrackerKF:
             
         # Predict
         self.F[0, 3] = dt; self.F[1, 4] = dt; self.F[2, 5] = dt
-        self.B[1, 0] = -0.5 * 981 * dt**2
-        self.B[4, 0] = -981 * dt
+        
+        # เปลี่ยนให้แกน Z เป็นความสูง (ถูกแรงโน้มถ่วงดึงลง)
+        self.B[2, 0] = -0.5 * 981 * dt**2 
+        self.B[5, 0] = -981 * dt
         
         self.state = np.dot(self.F, self.state) + self.B
         self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
@@ -69,8 +71,8 @@ class BallTrackerKF:
             
         x, y, z, vx, vy, vz = self.state.flatten()
         a = -490.5 # -0.5 * g
-        b = vy
-        c = y
+        b = vz # ความเร็วแนวดิ่งบนแกน Z
+        c = z  # ความสูงปัจจุบันบนแกน Z
         
         discriminant = b**2 - 4*a*c
         if discriminant < 0:
@@ -84,8 +86,8 @@ class BallTrackerKF:
             return None, None
             
         x_land = x + vx * t_land
-        z_land = z + vz * t_land
-        return float(x_land), float(z_land)
+        y_land = y + vy * t_land # ความลึกจุดตกไปหยุดอยู่บนแกน Y แทน
+        return float(x_land), float(y_land)
 
 # ตั้งค่า UDP Socket สำหรับส่งข้อมูล 3D ไปวาดกราฟ
 UDP_IP = "127.0.0.1"
@@ -94,7 +96,7 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # ตั้งค่า UDP Sender สำหรับส่งไป ESP32
 # อย่าลืมเปลี่ยน IP ตรงนี้ให้ตรงกับที่แสดงใน Serial Monitor ของ ESP32
-ESP32_IP = "192.168.1.XXX" 
+ESP32_IP = "192.168.137.66" 
 ESP32_PORT = 12345
 esp32_sender = UDPSender(ESP32_IP, ESP32_PORT)
 
@@ -185,6 +187,11 @@ with dai.Device(pipeline) as device:
     
     kf = BallTrackerKF()
     
+    # +++ ตั้งค่าระบบบันทึกวิดีโอ (Video Recording) +++
+    is_recording = False
+    video_writer = None
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # ใช้ MP4 Codec
+    
     while True:
         inRgb = qRgb.get()
         inDepth = qDepth.tryGet()
@@ -223,11 +230,13 @@ with dai.Device(pipeline) as device:
                             
                             # แปลงเป็นหน่วย เซนติเมตร (cm) 
                             X_cm = X_mm / 10.0
-                            Y_cam_cm = Y_mm / 10.0
-                            Z_cm = Z_mm / 10.0
                             
-                            # ปรับให้พิกัด Y=0 คือพื้น (ถ้าลูกบอลลอยขึ้น Y จะเป็นบวก)
-                            Y_cm = CAMERA_HEIGHT_CM - Y_cam_cm
+                            # +++ สลับแกน Y และ Z +++
+                            # ให้ Y เป็นความลึก (Depth) ตามที่ตั้งค่า Origin ไว้ก่อนหน้า (- 500)
+                            Y_cm = (Z_mm / 10.0) - 500.0
+                            
+                            # ให้ Z เป็นความสูง (Height) (ชี้ขึ้นฟ้าเป็นบวก)
+                            Z_cm = CAMERA_HEIGHT_CM - (Y_mm / 10.0)
                             
                             if measured_xyz is None:
                                 measured_xyz = [X_cm, Y_cm, Z_cm]
@@ -259,17 +268,29 @@ with dai.Device(pipeline) as device:
                     
                     # 🚀 ส่งข้อมูลจุดตก (Landing Point) ไปที่ ESP32
                     if landing_pt[0] is not None:
-                        esp32_sender.send_data_binary(landing_pt[0], 0.0, landing_pt[1])
+                        # ข้อมูลถูกแพ็กส่งเรียงตาม: (X, Y_ความลึก, Z_ความสูงที่จุดตกคือ 0)
+                        esp32_sender.send_data_binary(landing_pt[0], landing_pt[1], 0.0)
                     
                 except Exception:
                     pass
             
             if landing_pt[0] is not None:
-                lx, lz = landing_pt
-                cv2.putText(annotated_frame, f"Pred Land X:{lx:.1f} Z:{lz:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                lx, ly = landing_pt
+                cv2.putText(annotated_frame, f"Pred Land X:{lx:.1f} Y:{ly:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 kx, ky, kz = kf.state[:3].flatten()
                 cv2.putText(annotated_frame, f"KF X:{kx:.1f} Y:{ky:.1f} Z:{kz:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
             
+            # +++ ระบบบันทึกวิดีโอ +++
+            if is_recording:
+                # วาดไฟ REC สีแดงกะพริบที่มุมจอ
+                if int(time.time() * 2) % 2 == 0:
+                    cv2.circle(annotated_frame, (30, 95), 8, (0, 0, 255), -1)
+                    cv2.putText(annotated_frame, "REC", (45, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                
+                # เขียนรูปลงไฟล์วิดีโอ
+                if video_writer is not None:
+                    video_writer.write(annotated_frame)
+
             cv2.imshow("Red Ball 3D Map (X, Y, Z)", annotated_frame)
             
             if depth_frame is not None:
@@ -279,8 +300,25 @@ with dai.Device(pipeline) as device:
                     depth_rendered = cv2.applyColorMap(depth_rendered, cv2.COLORMAP_JET)
                     cv2.imshow("Depth Heatmap", depth_rendered)
             
-        if cv2.waitKey(1) == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord('r'):
+            # กดตัว 'r' เพื่อสลับเริ่ม/หยุดการอัดภาพ
+            is_recording = not is_recording
+            if is_recording:
+                h, w = frame.shape[:2]
+                filename = f"track_record_{int(time.time())}.mp4"
+                video_writer = cv2.VideoWriter(filename, fourcc, 30.0, (w, h))
+                print(f"\n[RECORD] เริ่มบันทึกวิดีโอลงไฟล์: {filename}")
+            else:
+                if video_writer is not None:
+                    video_writer.release()
+                    video_writer = None
+                print("\n[RECORD] หยุดบันทึกและเซฟไฟล์วิดีโอเรียบร้อยแล้ว")
+
+if video_writer is not None:
+    video_writer.release() # ป้องกันไฟล์เสียถ้ากำลังอัดอยู่แล้วกดปิดโปรแกรม
 
 cv2.destroyAllWindows()
 esp32_sender.close()
